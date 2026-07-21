@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Response
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Response, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -14,6 +14,8 @@ from sqlalchemy.orm import Session
 from src.database import Base, engine, get_db
 from src.models.user import User
 from src.models.chat import ChatSession, ChatMessage
+from src.models.document import Document, ParentChunk, DocumentJob
+from langchain_core.documents import Document as LangchainDocument
 from src.services.auth import (
     get_password_hash,
     verify_password,
@@ -49,6 +51,44 @@ app.add_middleware(
 # Service instantiations
 minio_service = MinioService()
 vector_store_service = VectorStoreService()
+
+_ranker = None
+def get_ranker():
+    global _ranker
+    if _ranker is None:
+        from flashrank import Ranker
+        _ranker = Ranker()
+    return _ranker
+
+def process_document_background(job_id: int, file_bytes: bytes, filename: str, user_id: int):
+    from src.database import SessionLocal
+    db = SessionLocal()
+    try:
+        job = db.query(DocumentJob).filter(DocumentJob.id == job_id).first()
+        if job:
+            job.status = "PROCESSING"
+            db.commit()
+
+        # Index document using Parent-Document splitting to Qdrant + DB
+        vector_store_service.process_and_index_document(
+            file_bytes=file_bytes,
+            filename=filename,
+            user_id=user_id,
+            db=db
+        )
+
+        if job:
+            job.status = "COMPLETED"
+            db.commit()
+    except Exception as e:
+        db.rollback()
+        job = db.query(DocumentJob).filter(DocumentJob.id == job_id).first()
+        if job:
+            job.status = "FAILED"
+            job.error_message = str(e)
+            db.commit()
+    finally:
+        db.close()
 
 # Request Pydantic models
 class ChatRequest(BaseModel):
@@ -342,9 +382,15 @@ def download_document(filename: str, token: Optional[str] = Query(None), db: Ses
         raise HTTPException(status_code=404, detail=f"File not found or failed to download: {str(e)}")
 
 @app.post("/upload", tags=["Documents"])
-async def upload_document(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
+async def upload_document(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """
-    Uploads a PDF or DOCX document to MinIO, extracts text, chunks it, and indexes it in FAISS.
+    Uploads a PDF or DOCX document to MinIO, and schedules text extraction,
+    parent-child chunking, and Qdrant indexing in the background.
     """
     filename_lower = file.filename.lower()
     if not (filename_lower.endswith(".pdf") or filename_lower.endswith(".docx")):
@@ -365,22 +411,43 @@ async def upload_document(file: UploadFile = File(...), current_user: User = Dep
             content_type=file.content_type
         )
 
-        # 2. Extract, chunk, and index to FAISS
-        chunks_indexed = vector_store_service.process_and_index_document(file_bytes, file.filename)
+        # 2. Create the DocumentJob in DB
+        job = DocumentJob(
+            filename=file.filename,
+            status="PENDING",
+            user_id=current_user.id
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        # 3. Schedule background processing
+        background_tasks.add_task(
+            process_document_background,
+            job_id=job.id,
+            file_bytes=file_bytes,
+            filename=file.filename,
+            user_id=current_user.id
+        )
 
         return {
-            "message": "File successfully uploaded and indexed",
+            "message": "File successfully uploaded. Ingestion has been scheduled in the background.",
             "filename": file.filename,
             "size": file_size,
-            "chunks_indexed": chunks_indexed
+            "job_id": job.id,
+            "status": "PENDING"
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to process and index file: {str(e)}")
 
 @app.post("/documents/sync", tags=["Documents"])
-def sync_documents_from_minio(current_user: User = Depends(get_current_user)):
+def sync_documents_from_minio(
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """
-    Downloads PDF/DOCX files stored in MinIO and indexes them in the FAISS vector database
+    Downloads PDF/DOCX files stored in MinIO and schedules them for indexing in Qdrant/PostgreSQL
     if they are not already indexed.
     """
     try:
@@ -389,15 +456,15 @@ def sync_documents_from_minio(current_user: User = Depends(get_current_user)):
         if not minio_docs:
             return {
                 "message": "No documents found in MinIO bucket to sync.",
-                "total_chunks_indexed": 0,
+                "jobs_created": 0,
                 "synced_documents": []
             }
 
-        # 2. Retrieve already indexed filenames from FAISS to prevent duplication
-        indexed_files = vector_store_service.get_indexed_filenames()
+        # 2. Retrieve already indexed filenames for this user
+        indexed_files = vector_store_service.get_indexed_filenames(current_user.id, db)
 
         synced_files = []
-        total_chunks = 0
+        jobs_created = 0
 
         # 3. Iterate and process each PDF or DOCX file
         for doc in minio_docs:
@@ -410,25 +477,72 @@ def sync_documents_from_minio(current_user: User = Depends(get_current_user)):
             if filename in indexed_files:
                 continue
 
+            # Skip if there's already an active sync/ingestion job for this file
+            active_job = db.query(DocumentJob).filter(
+                DocumentJob.filename == filename,
+                DocumentJob.user_id == current_user.id,
+                DocumentJob.status.in_(["PENDING", "PROCESSING"])
+            ).first()
+            if active_job:
+                continue
+
             # Download file from MinIO
             file_bytes = minio_service.download_file(filename)
 
-            # Process and index document chunks into FAISS
-            chunks_indexed = vector_store_service.process_and_index_document(file_bytes, filename)
+            # Create job record
+            job = DocumentJob(
+                filename=filename,
+                status="PENDING",
+                user_id=current_user.id
+            )
+            db.add(job)
+            db.commit()
+            db.refresh(job)
+
+            # Add to background tasks
+            background_tasks.add_task(
+                process_document_background,
+                job_id=job.id,
+                file_bytes=file_bytes,
+                filename=filename,
+                user_id=current_user.id
+            )
             
             synced_files.append({
                 "filename": filename,
-                "chunks_indexed": chunks_indexed
+                "job_id": job.id
             })
-            total_chunks += chunks_indexed
+            jobs_created += 1
 
         return {
-            "message": f"Successfully synced {len(synced_files)} new document(s) from MinIO to FAISS vector store.",
-            "total_chunks_indexed": total_chunks,
+            "message": f"Successfully scheduled {jobs_created} new document(s) from MinIO for indexing.",
+            "jobs_created": jobs_created,
             "synced_documents": synced_files
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to sync documents from MinIO: {str(e)}")
+
+@app.get("/documents/jobs/{job_id}", tags=["Documents"])
+def get_job_status(job_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """
+    Retrieves the status of a background document ingestion job.
+    """
+    job = db.query(DocumentJob).filter(
+        DocumentJob.id == job_id,
+        DocumentJob.user_id == current_user.id
+    ).first()
+    
+    if not job:
+        raise HTTPException(status_code=404, detail="Ingestion job not found.")
+        
+    return {
+        "job_id": job.id,
+        "filename": job.filename,
+        "status": job.status,
+        "error_message": job.error_message,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at
+    }
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 def chat_with_docs(request: ChatRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -478,9 +592,44 @@ def chat_with_docs(request: ChatRequest, current_user: User = Depends(get_curren
                 search_query = standalone_res
 
         # 5. Similarity search with (possibly condensed) query
-        docs = vector_store_service.similarity_search(search_query, k=request.k)
+        retrieved_docs = vector_store_service.similarity_search(
+            query=search_query,
+            user_id=current_user.id,
+            db=db,
+            k=15
+        )
         
-        # 6. Prepare context string
+        # 6. Rerank using FlashRank
+        docs = []
+        if retrieved_docs:
+            try:
+                ranker = get_ranker()
+                passages = [
+                    {
+                        "id": i,
+                        "text": doc.page_content,
+                        "meta": doc.metadata
+                    }
+                    for i, doc in enumerate(retrieved_docs)
+                ]
+                from flashrank import RerankRequest
+                rerank_request = RerankRequest(query=search_query, passages=passages)
+                results = ranker.rerank(rerank_request)
+                
+                # Filter to top request.k (default 4) reranked chunks
+                top_results = results[:request.k]
+                docs = [
+                    LangchainDocument(
+                        page_content=res["text"],
+                        metadata=res["meta"]
+                    )
+                    for res in top_results
+                ]
+            except Exception as re_err:
+                print(f"Warning: Reranking failed: {re_err}. Falling back to default top {request.k} results.")
+                docs = retrieved_docs[:request.k]
+        
+        # 7. Prepare context string
         context_parts = []
         if docs:
             for i, doc in enumerate(docs):
@@ -531,6 +680,24 @@ def chat_with_docs(request: ChatRequest, current_user: User = Depends(get_curren
             
             if source_content.lower() != "none" and source_content != "":
                 used_sources = [s.strip() for s in source_content.split(",")]
+        else:
+            # Fallback heuristic: if the LLM successfully answered the question using context
+            # but omitted the "Sources: [...]" instruction format, attribute it to retrieved docs.
+            lowered_ans = answer_text.lower()
+            not_found_flags = [
+                "cannot find the answer",
+                "do not know",
+                "no relevant document",
+                "not mentioned in the provided",
+                "not found in the uploaded"
+            ]
+            if not any(flag in lowered_ans for flag in not_found_flags) and docs:
+                seen_srcs = set()
+                for doc in docs:
+                    src_name = doc.metadata.get("source")
+                    if src_name and src_name not in seen_srcs:
+                        seen_srcs.add(src_name)
+                        used_sources.append(src_name)
 
         # 11. Format source objects
         filtered_sources = []

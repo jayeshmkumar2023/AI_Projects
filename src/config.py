@@ -24,6 +24,9 @@ class Settings:
 
     # Vector store paths
     FAISS_INDEX_DIR = os.getenv("FAISS_INDEX_DIR", "data/faiss_index")
+    QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+    QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+    QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "auditchatbot")
 
     # PostgreSQL Database Settings
     DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/auditdb")
