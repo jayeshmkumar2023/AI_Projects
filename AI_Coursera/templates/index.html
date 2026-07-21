@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Emotion Detector</title>
+    <script src="{{ url_for('static', filename='mywebscript.js') }}"></script>
+</head>
+<body>
+    <h1>Emotion Detector Application</h1>
+    <div>
+        <label for="textToAnalyze">Enter Text for Emotion Detection:</label><br>
+        <textarea id="textToAnalyze" rows="4" cols="50"></textarea><br><br>
+        <button onclick="RunSentimentAnalysis()">Run Sentiment Analysis</button>
+    </div>
+    <br>
+    <div id="system_response"></div>
+</body>
+</html>
