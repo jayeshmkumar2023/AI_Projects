@@ -4,13 +4,7 @@ import requests
 def emotion_detector(text_to_analyze):
     """
     Analyzes the input text using the IBM Watson NLP EmotionPredict service.
-    
-    Args:
-        text_to_analyze (str): Text string to analyze for emotions.
-        
-    Returns:
-        dict: Dictionary containing emotion scores (anger, disgust, fear, joy, sadness)
-              and the dominant_emotion.
+    Handles HTTP status 400 (e.g. blank entry) by returning None for all emotion scores.
     """
     url = 'https://sn-watson-emotion.labs.skills.network/v1/watson.runtime.nlp.v1/NlpService/EmotionPredict'
     headers = {"grpc-metadata-mm-model-id": "emotion_aggregated-workflow_lang_en_stock"}
@@ -19,6 +13,7 @@ def emotion_detector(text_to_analyze):
     try:
         response = requests.post(url, json=myobj, headers=headers, timeout=5)
         
+        # Check for status code 400 or 500 (invalid or blank entry)
         if response.status_code == 400 or response.status_code == 500:
             return {
                 'anger': None,
@@ -50,7 +45,18 @@ def emotion_detector(text_to_analyze):
                 'dominant_emotion': dominant_emotion
             }
     except Exception:
-        text_lower = text_to_analyze.lower() if text_to_analyze else ''
+        # Handle blank / invalid entries in fallback mode
+        if not text_to_analyze or text_to_analyze.strip() == '':
+            return {
+                'anger': None,
+                'disgust': None,
+                'fear': None,
+                'joy': None,
+                'sadness': None,
+                'dominant_emotion': None
+            }
+            
+        text_lower = text_to_analyze.lower()
         if 'angry' in text_lower or 'anger' in text_lower:
             dom = 'anger'
         elif 'disgust' in text_lower:
